@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::ensure!(path.exists(), "{name} does not exist: {}", path.display());
     }
 
-    let client = sequencer_client::SequencerClient::new(&args.sequencer_url);
+    let client = sequencer_client::SequencerClient::new(&args.sequencer_url, "zisk_prover");
     let prover = prover::ZiskProver::new(
         args.zisk_binary,
         args.elf_path,
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         // Poll for available ZiSK batch data.
-        let batch = match client.poll_next_batch().await {
+        let batch = match client.pick_next_batch().await {
             Ok(Some(batch)) => batch,
             Ok(None) => {
                 tracing::trace!("no ZiSK batches available");
