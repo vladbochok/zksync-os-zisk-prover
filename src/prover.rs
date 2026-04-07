@@ -1,10 +1,7 @@
 //! ZiSK proof generation via `cargo-zisk` subprocesses.
 //!
-//! Runs STARK aggregation → SNARK wrapping, parses the output, and cleans up
-//! work directories on success.
-//!
-//! Uses `tokio::process` so subprocess waits are futures that can be cancelled
-//! via `CancellationToken` — no busy-polling with `thread::sleep`.
+//! Uses `tokio::process` so subprocess waits can be cancelled instantly
+//! via `CancellationToken` — no busy-polling.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -12,17 +9,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::metrics::ZISK_PROVER_METRICS;
 
-/// Expected proof output sizes (invariants of the ZiSK Plonk verifier).
 const ZISK_SNARK_PROOF_BYTES: usize = 768;
 const ZISK_PUBLIC_VALUES_BYTES: usize = 256;
 
-/// Proof output.
 pub struct ZiskSnarkOutput {
     pub proof: Vec<u8>,
     pub public_values: Vec<u8>,
 }
 
-/// ZiSK prover with validated paths.
 #[derive(Clone)]
 pub struct ZiskProver {
     binary: PathBuf,
@@ -43,13 +37,11 @@ impl ZiskProver {
         Self { binary, elf_path, proving_key, proving_key_snark, work_dir_base }
     }
 
-    /// Generate a ZiSK SNARK proof for the given batch.
+    /// Generate a ZiSK SNARK proof. Returns `Ok(None)` if cancelled.
     ///
-    /// Returns `Ok(None)` if cancelled via the shutdown token.
-    /// This runs on a blocking thread but the subprocess is managed with
-    /// `std::process` + periodic cancel checks (since `tokio::process`
-    /// can't be used from `spawn_blocking`).
-    pub fn generate_proof(
+    /// This is an async function — subprocesses are managed with `tokio::process`
+    /// and cancellation uses `select!` against the token (instant response).
+    pub async fn generate_proof(
         &self,
         zisk_bincode: &[u8],
         batch_number: u64,
@@ -58,10 +50,10 @@ impl ZiskProver {
         let start = Instant::now();
         let work_dir = self.work_dir_base.join(format!("batch_{batch_number}"));
 
-        let _ = std::fs::remove_dir_all(&work_dir);
-        std::fs::create_dir_all(&work_dir)?;
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        tokio::fs::create_dir_all(&work_dir).await?;
 
-        let result = self.run_pipeline(zisk_bincode, batch_number, &work_dir, cancel);
+        let result = self.run_pipeline(zisk_bincode, batch_number, &work_dir, cancel).await;
 
         let elapsed = start.elapsed();
         ZISK_PROVER_METRICS.proof_generation_time.observe(elapsed);
@@ -69,11 +61,11 @@ impl ZiskProver {
         match &result {
             Ok(Some(_)) => {
                 tracing::info!(batch_number, elapsed_secs = elapsed.as_secs(), "proof generated");
-                let _ = std::fs::remove_dir_all(&work_dir);
+                let _ = tokio::fs::remove_dir_all(&work_dir).await;
             }
             Ok(None) => {
                 tracing::info!(batch_number, "proof cancelled by shutdown");
-                let _ = std::fs::remove_dir_all(&work_dir);
+                let _ = tokio::fs::remove_dir_all(&work_dir).await;
             }
             Err(e) => {
                 tracing::error!(
@@ -86,7 +78,7 @@ impl ZiskProver {
         result
     }
 
-    fn run_pipeline(
+    async fn run_pipeline(
         &self,
         zisk_bincode: &[u8],
         batch_number: u64,
@@ -98,7 +90,7 @@ impl ZiskProver {
 
         // STARK aggregation
         let stark_dir = work_dir.join("stark");
-        std::fs::create_dir_all(stark_dir.join("proofs"))?;
+        tokio::fs::create_dir_all(stark_dir.join("proofs")).await?;
         tracing::info!(batch_number, "STARK aggregation starting");
         let stark_start = Instant::now();
         if !run_cancellable(&self.binary, &[
@@ -108,7 +100,7 @@ impl ZiskProver {
             "-k", &p(&self.proving_key),
             "-o", &p(&stark_dir),
             "--emulator", "--aggregation", "--save-proofs", "-v",
-        ], cancel)? {
+        ], cancel).await? {
             return Ok(None);
         }
         ZISK_PROVER_METRICS.stark_time.observe(stark_start.elapsed());
@@ -120,7 +112,7 @@ impl ZiskProver {
 
         // SNARK wrapping
         let snark_dir = work_dir.join("snark");
-        std::fs::create_dir_all(&snark_dir)?;
+        tokio::fs::create_dir_all(&snark_dir).await?;
         tracing::info!(batch_number, "SNARK wrapping starting");
         let snark_start = Instant::now();
         if !run_cancellable(&self.binary, &[
@@ -130,7 +122,7 @@ impl ZiskProver {
             "--proving-key-snark", &p(&self.proving_key_snark),
             "-o", &p(&snark_dir),
             "-v",
-        ], cancel)? {
+        ], cancel).await? {
             return Ok(None);
         }
         ZISK_PROVER_METRICS.snark_time.observe(snark_start.elapsed());
@@ -157,40 +149,40 @@ fn write_zisk_input(path: &Path, bincode: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a subprocess, checking the cancel token every second.
-/// Returns `Ok(true)` on success, `Ok(false)` on cancellation.
-fn run_cancellable(
+/// Run a subprocess, cancellable via token. Uses `tokio::process` — no polling.
+async fn run_cancellable(
     binary: &Path,
     args: &[&str],
     cancel: &CancellationToken,
 ) -> anyhow::Result<bool> {
-    let mut child = std::process::Command::new(binary)
+    let mut child = tokio::process::Command::new(binary)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    loop {
-        if cancel.is_cancelled() {
-            tracing::info!("shutdown requested, killing subprocess");
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(false);
-        }
-        match child.try_wait()? {
-            Some(status) if status.success() => return Ok(true),
-            Some(_) => {
-                let stderr = child.stderr.take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    })
-                    .unwrap_or_default();
+    tokio::select! {
+        status = child.wait() => {
+            let status = status?;
+            if status.success() {
+                Ok(true)
+            } else {
+                // Read stderr for error details
+                let stderr = if let Some(mut stderr) = child.stderr.take() {
+                    let mut buf = String::new();
+                    tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf).await.ok();
+                    buf
+                } else {
+                    String::new()
+                };
                 let tail = &stderr[stderr.len().saturating_sub(1000)..];
                 anyhow::bail!("{} failed: {tail}", binary.display());
             }
-            None => std::thread::sleep(std::time::Duration::from_secs(1)),
+        }
+        _ = cancel.cancelled() => {
+            tracing::info!("shutdown requested, killing subprocess");
+            child.kill().await.ok();
+            Ok(false)
         }
     }
 }

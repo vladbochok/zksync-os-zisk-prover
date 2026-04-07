@@ -202,17 +202,12 @@ async fn main() -> anyhow::Result<()> {
             "picked ZiSK batch"
         );
 
-        // Prove. The subprocess is managed with tokio::process so we can
-        // select! against cancellation instead of polling an AtomicBool.
-        let cancel_token = cancel.clone();
-        let result = tokio::task::spawn_blocking({
-            let prover = prover.clone();
-            let data = batch.zisk_data.clone();
-            let batch_num = batch.batch_number;
-            let shutdown = cancel_token.clone();
-            move || prover.generate_proof(&data, batch_num, &shutdown)
-        })
-        .await??;
+        // Prove. Uses tokio::process internally — cancellation is instant.
+        let result = prover.generate_proof(
+            &batch.zisk_data,
+            batch.batch_number,
+            &cancel,
+        ).await?;
 
         let Some(result) = result else {
             tracing::info!("proof cancelled, exiting");
