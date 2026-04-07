@@ -6,18 +6,40 @@
 //!
 //! Mirrors the Airbender prover service (`zksync-os-prover-service`) in
 //! architecture: pull model over HTTP, no server-side process management.
+//!
+//! Supports HTTP Basic Auth via URL credentials, graceful SIGTERM shutdown,
+//! and rejects unsupported VK hashes before proving.
 
+mod metrics;
 mod prover;
 mod sequencer_client;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Supported VK hashes. The prover will only prove batches whose VK hash
+/// appears in this list. Prevents wasting GPU time on batches from
+/// protocol versions we can't produce valid proofs for.
+///
+/// Updated when the guest ELF or SNARK circuit changes.
+/// Format: lowercase hex with 0x prefix.
+const SUPPORTED_VK_HASHES: &[&str] = &[
+    // Current guest ELF VK hash — update when ZiSK_vk.json changes.
+    // Run `cargo run -- --variant zisk` in era-contracts/tools/verifier-gen
+    // to see the current hash, or use update-zisk-vk.sh --extract-only.
+    "0x21a582e2fb44e0732b565ffe36331ffb77a315870076b1dc1556579bbc4a67b2",
+    // Legacy VK hash from initial deployment.
+    "0x124ebcd537a1e1c152774dd18f67660e35625bba0b669bf3b4836d636b105337",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "zksync-os-zisk-prover-service", about = "ZiSK prover for ZKsync OS")]
 struct Args {
     /// Sequencer URL for polling ZiSK batch data and submitting proofs.
+    /// Supports Basic Auth via URL: http://user:pass@host:port
     #[arg(short, long)]
     sequencer_url: String,
 
@@ -65,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         sequencer_url = %args.sequencer_url,
         zisk_binary = %args.zisk_binary.display(),
         elf_path = %args.elf_path.display(),
+        supported_vk_hashes = ?SUPPORTED_VK_HASHES,
         "Starting ZiSK prover service"
     );
 
@@ -78,7 +101,9 @@ async fn main() -> anyhow::Result<()> {
         anyhow::ensure!(path.exists(), "{name} does not exist: {}", path.display());
     }
 
-    let client = sequencer_client::SequencerClient::new(&args.sequencer_url, "zisk_prover");
+    let client = sequencer_client::SequencerClient::new(&args.sequencer_url, "zisk_prover")?;
+    tracing::info!(url = client.url(), "connected to sequencer (credentials stripped)");
+
     let prover = prover::ZiskProver::new(
         args.zisk_binary,
         args.elf_path,
@@ -90,7 +115,26 @@ async fn main() -> anyhow::Result<()> {
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
     let mut proofs_generated: u64 = 0;
 
+    // Graceful shutdown: set flag on SIGTERM/SIGINT, prover checks it between phases.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down gracefully"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down gracefully"),
+        }
+        shutdown_clone.store(true, Ordering::Relaxed);
+    });
+
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown requested, exiting main loop");
+            break;
+        }
+
         // Poll for available ZiSK batch data.
         let batch = match client.pick_next_batch().await {
             Ok(Some(batch)) => batch,
@@ -106,9 +150,23 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Protocol version validation: reject unsupported VK hashes.
+        let vk_lower = batch.vk_hash.to_lowercase();
+        if !SUPPORTED_VK_HASHES.iter().any(|h| h.to_lowercase() == vk_lower) {
+            tracing::warn!(
+                batch_number = batch.batch_number,
+                vk_hash = %batch.vk_hash,
+                "unsupported VK hash — skipping batch (protocol version not supported by this prover)"
+            );
+            // Sleep briefly to avoid busy-looping on the same unsupported batch.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+
         tracing::info!(
             batch_number = batch.batch_number,
             data_bytes = batch.zisk_data.len(),
+            vk_hash = %batch.vk_hash,
             "received ZiSK batch data"
         );
 
@@ -117,9 +175,16 @@ async fn main() -> anyhow::Result<()> {
             let prover = prover.clone();
             let data = batch.zisk_data.clone();
             let batch_num = batch.batch_number;
-            move || prover.generate_proof(&data, batch_num)
+            let shutdown = shutdown.clone();
+            move || prover.generate_proof(&data, batch_num, &shutdown)
         })
         .await??;
+
+        // Check if cancelled by shutdown
+        let Some(result) = result else {
+            tracing::info!("proof generation was cancelled, exiting");
+            break;
+        };
 
         tracing::info!(
             batch_number = batch.batch_number,

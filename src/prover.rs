@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use crate::metrics::ZISK_PROVER_METRICS;
+
 /// Expected proof output sizes (invariants of the ZiSK Plonk verifier).
 const ZISK_SNARK_PROOF_BYTES: usize = 768;
 const ZISK_PUBLIC_VALUES_BYTES: usize = 256;
@@ -45,23 +47,32 @@ impl ZiskProver {
     }
 
     /// Generate a ZiSK SNARK proof for the given batch.
+    ///
+    /// Returns `Ok(None)` if cancelled via the shutdown token.
     pub fn generate_proof(
         &self,
         zisk_bincode: &[u8],
         batch_number: u64,
-    ) -> anyhow::Result<ZiskSnarkOutput> {
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<Option<ZiskSnarkOutput>> {
         let start = Instant::now();
         let work_dir = self.work_dir_base.join(format!("batch_{batch_number}"));
 
         let _ = std::fs::remove_dir_all(&work_dir);
         std::fs::create_dir_all(&work_dir)?;
 
-        let result = self.run_pipeline(zisk_bincode, batch_number, &work_dir);
+        let result = self.run_pipeline(zisk_bincode, batch_number, &work_dir, shutdown);
 
         let elapsed = start.elapsed();
+        ZISK_PROVER_METRICS.proof_generation_time.observe(elapsed);
+
         match &result {
-            Ok(_) => {
+            Ok(Some(_)) => {
                 tracing::info!(batch_number, elapsed_secs = elapsed.as_secs(), "proof generated");
+                let _ = std::fs::remove_dir_all(&work_dir);
+            }
+            Ok(None) => {
+                tracing::info!(batch_number, "proof generation cancelled by shutdown");
                 let _ = std::fs::remove_dir_all(&work_dir);
             }
             Err(e) => {
@@ -82,7 +93,8 @@ impl ZiskProver {
         zisk_bincode: &[u8],
         batch_number: u64,
         work_dir: &Path,
-    ) -> anyhow::Result<ZiskSnarkOutput> {
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<Option<ZiskSnarkOutput>> {
         // Write input.
         let input_path = work_dir.join("input.bin");
         write_zisk_input(&input_path, zisk_bincode)?;
@@ -91,7 +103,8 @@ impl ZiskProver {
         let stark_dir = work_dir.join("stark");
         std::fs::create_dir_all(stark_dir.join("proofs"))?;
         tracing::info!(batch_number, "running STARK aggregation...");
-        run_subprocess(
+        let stark_start = Instant::now();
+        let child = run_subprocess(
             &self.binary,
             &[
                 "prove",
@@ -103,14 +116,26 @@ impl ZiskProver {
             ],
         )?;
 
+        // Wait with shutdown check
+        let status = wait_with_shutdown(child, shutdown)?;
+        if !status {
+            return Ok(None); // cancelled
+        }
+        ZISK_PROVER_METRICS.stark_time.observe(stark_start.elapsed());
+
         let vadcop_path = stark_dir.join("vadcop_final_proof.bin");
         anyhow::ensure!(vadcop_path.exists(), "vadcop_final_proof.bin not generated");
+
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
 
         // SNARK wrapping.
         let snark_dir = work_dir.join("snark");
         std::fs::create_dir_all(&snark_dir)?;
         tracing::info!(batch_number, "running SNARK wrapping...");
-        run_subprocess(
+        let snark_start = Instant::now();
+        let child = run_subprocess(
             &self.binary,
             &[
                 "prove-snark",
@@ -122,10 +147,16 @@ impl ZiskProver {
             ],
         )?;
 
+        let status = wait_with_shutdown(child, shutdown)?;
+        if !status {
+            return Ok(None);
+        }
+        ZISK_PROVER_METRICS.snark_time.observe(snark_start.elapsed());
+
         let snark_proof_path = snark_dir.join("final_snark_proof.bin");
         anyhow::ensure!(snark_proof_path.exists(), "final_snark_proof.bin not generated");
 
-        parse_snark_output(&snark_proof_path)
+        parse_snark_output(&snark_proof_path).map(Some)
     }
 }
 
@@ -146,15 +177,48 @@ fn write_zisk_input(path: &Path, bincode: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a subprocess and check exit code.
-fn run_subprocess(binary: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new(binary).args(args).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = &stderr[stderr.len().saturating_sub(1000)..];
-        anyhow::bail!("{} failed: {tail}", binary.display());
+/// Spawn a subprocess (non-blocking).
+fn run_subprocess(binary: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
+    let child = Command::new(binary).args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    Ok(child)
+}
+
+/// Wait for a child process, checking shutdown flag every second.
+/// Returns `Ok(true)` if process exited successfully, `Ok(false)` if shutdown requested.
+fn wait_with_shutdown(
+    mut child: std::process::Child,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<bool> {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("shutdown requested, killing subprocess");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    let stderr = child.stderr.take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                            buf
+                        })
+                        .unwrap_or_default();
+                    let tail = &stderr[stderr.len().saturating_sub(1000)..];
+                    anyhow::bail!("subprocess failed: {tail}");
+                }
+                return Ok(true);
+            }
+            None => {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
     }
-    Ok(())
 }
 
 /// Parse `final_snark_proof.bin`: `[proof_len:u64_LE][proof][pv_len:u64_LE][pv]`.
