@@ -119,18 +119,6 @@ Prometheus metrics are served at `--metrics-address` (default `:3313`):
 | `zisk_prover_stark_time` | Histogram | STARK aggregation time |
 | `zisk_prover_snark_time` | Histogram | SNARK wrapping time |
 
-## GPU Sharing with Airbender
-
-Both Airbender and ZiSK provers use the GPU. For single-GPU setups, run them sequentially:
-
-```bash
-# Round: Airbender first (--iterations 1), then ZiSK (--iterations 1)
-zksync-os-prover-service --iterations 1 ...  # exits after 1 SNARK, frees GPU
-zksync-os-zisk-prover-service --iterations 1 ...  # exits after 1 proof, frees GPU
-```
-
-See `run_e2e_gpu.sh` in the parent repo for the orchestration script.
-
 ## License
 
 ZKsync OS repositories are distributed under the terms of either
