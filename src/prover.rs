@@ -20,6 +20,8 @@ pub struct ZiskSnarkOutput {
 #[derive(Clone)]
 pub struct ZiskProver {
     binary: PathBuf,
+    /// Optional separate binary for SNARK wrapping (e.g. CPU build when GPU segfaults).
+    snark_binary: Option<PathBuf>,
     elf_path: PathBuf,
     proving_key: PathBuf,
     proving_key_snark: PathBuf,
@@ -34,7 +36,12 @@ impl ZiskProver {
         proving_key_snark: PathBuf,
         work_dir_base: PathBuf,
     ) -> Self {
-        Self { binary, elf_path, proving_key, proving_key_snark, work_dir_base }
+        Self { binary, snark_binary: None, elf_path, proving_key, proving_key_snark, work_dir_base }
+    }
+
+    pub fn with_snark_binary(mut self, binary: PathBuf) -> Self {
+        self.snark_binary = Some(binary);
+        self
     }
 
     /// Generate a ZiSK SNARK proof. Returns `Ok(None)` if cancelled.
@@ -110,12 +117,16 @@ impl ZiskProver {
 
         if cancel.is_cancelled() { return Ok(None); }
 
-        // SNARK wrapping
+        // SNARK wrapping — use CPU binary if GPU binary segfaults.
+        // The STARK phase benefits from GPU (18s vs 19min), but the SNARK
+        // wrapping's recursivef proof generation may crash on some GPUs
+        // (Blackwell/compute 12.0). CPU SNARK takes ~3 min, still fast.
+        let snark_binary = self.snark_binary.as_deref().unwrap_or(&self.binary);
         let snark_dir = work_dir.join("snark");
         tokio::fs::create_dir_all(&snark_dir).await?;
         tracing::info!(batch_number, "SNARK wrapping starting");
         let snark_start = Instant::now();
-        if !run_cancellable(&self.binary, &[
+        if !run_cancellable(snark_binary, &[
             "prove-snark",
             "--proof", &p(&vadcop_path),
             "--elf", &p(&self.elf_path),

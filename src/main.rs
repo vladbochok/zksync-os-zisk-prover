@@ -36,6 +36,11 @@ struct Args {
     #[arg(long)]
     proving_key_snark: PathBuf,
 
+    /// Optional separate cargo-zisk binary for SNARK wrapping.
+    /// Use the CPU build if the GPU binary segfaults during prove-snark.
+    #[arg(long)]
+    snark_binary: Option<PathBuf>,
+
     /// Directory for intermediate proof files.
     #[arg(long, default_value = "/tmp/zisk_proofs")]
     work_dir: PathBuf,
@@ -130,13 +135,16 @@ async fn main() -> anyhow::Result<()> {
     let client = sequencer_client::SequencerClient::new(&args.sequencer_url, "zisk_prover")?;
     tracing::info!(url = client.url(), "connected to sequencer");
 
-    let prover = prover::ZiskProver::new(
+    let mut prover = prover::ZiskProver::new(
         args.zisk_binary,
         args.elf_path,
         args.proving_key,
         args.proving_key_snark,
         args.work_dir,
     );
+    if let Some(snark_bin) = args.snark_binary {
+        prover = prover.with_snark_binary(snark_bin);
+    }
 
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
     let mut proofs_generated: u64 = 0;
