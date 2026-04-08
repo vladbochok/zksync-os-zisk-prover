@@ -150,6 +150,9 @@ fn write_zisk_input(path: &Path, bincode: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Run a subprocess, cancellable via token. Uses `tokio::process` — no polling.
+///
+/// stdout/stderr are inherited (not piped) to avoid blocking cargo-zisk's
+/// 200+ threads on pipe buffer contention during proof generation.
 async fn run_cancellable(
     binary: &Path,
     args: &[&str],
@@ -157,8 +160,8 @@ async fn run_cancellable(
 ) -> anyhow::Result<bool> {
     let mut child = tokio::process::Command::new(binary)
         .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
     tokio::select! {
@@ -167,16 +170,7 @@ async fn run_cancellable(
             if status.success() {
                 Ok(true)
             } else {
-                // Read stderr for error details
-                let stderr = if let Some(mut stderr) = child.stderr.take() {
-                    let mut buf = String::new();
-                    tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf).await.ok();
-                    buf
-                } else {
-                    String::new()
-                };
-                let tail = &stderr[stderr.len().saturating_sub(1000)..];
-                anyhow::bail!("{} failed: {tail}", binary.display());
+                anyhow::bail!("{} failed with exit code: {:?}", binary.display(), status.code());
             }
         }
         _ = cancel.cancelled() => {
